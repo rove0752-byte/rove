@@ -23,6 +23,7 @@
     "ai": "^7.0.128",
     "eve": "^0.75.1",
     "playwright": "^1.64.0",
+    "stripe": "^17.0.0",
     "zod": "4.5.4"
   },
   "devDependencies": {
