@@ -102,6 +102,7 @@ export default defineChannel({
 
     POST('/v1/webhook', async (req) => {
       if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+        console.log('Webhook error: Stripe not configured');
         return new Response('Stripe not configured', { status: 503 });
       }
 
@@ -111,13 +112,18 @@ export default defineChannel({
       let event;
       try {
         event = stripe.webhooks.constructEvent(raw, sig!, process.env.STRIPE_WEBHOOK_SECRET);
-      } catch {
-        return new Response('Webhook signature verification failed', { status: 400 });
+      } catch (err) {
+        console.log('Webhook signature error:', err instanceof Error ? err.message : err);
+        return new Response(`Webhook signature verification failed: ${err instanceof Error ? err.message : 'unknown'}`, { status: 400 });
       }
 
+      console.log('Webhook received:', event.type);
       if (event.type === 'checkout.session.completed') {
         const apiKey = event.data.object.metadata?.apiKey;
-        if (apiKey) paid.add(apiKey);
+        if (apiKey) {
+          paid.add(apiKey);
+          console.log('Marked paid:', apiKey);
+        }
       }
 
       return Response.json({ received: true });
