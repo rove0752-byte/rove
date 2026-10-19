@@ -92,8 +92,8 @@ export default defineChannel({
       const session = await stripe.checkout.sessions.create({
         mode: 'subscription',
         line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
-        success_url: 'https://rove-azure.vercel.app/?success=true',
-        cancel_url: 'https://rove-azure.vercel.app/?canceled=true',
+        success_url: 'https://rovezi.com/?success=true',
+        cancel_url: 'https://rovezi.com/?canceled=true',
         metadata: { apiKey: apiKey ?? '' },
       });
 
