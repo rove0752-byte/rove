@@ -6,6 +6,13 @@ import { z } from 'zod';
 import Stripe from 'stripe';
 import { inspectPage } from '../lib/browser';
 import { validateUrl } from '../lib/policy';
+import {
+  claimExtractSlot,
+  hashApiKey,
+  isKvConfigured,
+  recordCompletedCheckout,
+  refundExtractSlot,
+} from '../lib/kv-store';
 
 const runSchema = z.object({
   url: z.string().url().max(2048),
@@ -16,10 +23,6 @@ const runSchema = z.object({
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
-
-// Simple in-memory counters (replace with KV/DB for production)
-const usage = new Map<string, number>();
-const paid = new Set<string>();
 
 function authorized(req: Request) {
   const key = process.env.ROVE_API_KEY;
@@ -61,21 +64,37 @@ export default defineChannel({
       if (!authorized(req)) return denied();
       if (extracting) return Response.json({ error: 'An extraction is running. Try again shortly.' }, { status: 429 });
 
-      const apiKey = getApiKey(req) ?? 'anonymous';
-      const used = usage.get(apiKey) ?? 0;
-      const isPaid = paid.has(apiKey);
+      // Parse before reserving quota so invalid payloads do not consume a slot.
+      let input: { url: string };
+      try {
+        input = z.object({ url: z.string().url().max(2048) }).strict().parse(await body(req));
+      } catch (e) {
+        return Response.json({ error: e instanceof Error ? e.message : 'Invalid request' }, { status: 422 });
+      }
 
-      if (!isPaid && used >= 50) {
+      const apiKey = getApiKey(req) ?? 'anonymous';
+      let usageKey: string | null;
+      try {
+        usageKey = await claimExtractSlot(apiKey);
+      } catch (error) {
+        console.error('KV quota check failed:', error);
+        return Response.json({ error: 'Usage storage unavailable' }, { status: 503 });
+      }
+      if (!usageKey) {
         return Response.json({ error: 'Free limit reached (50/month). Upgrade via POST /v1/checkout' }, { status: 402 });
       }
 
       try {
-        const input = z.object({ url: z.string().url().max(2048) }).strict().parse(await body(req));
         extracting = true;
         const result = await inspectPage(input.url);
-        usage.set(apiKey, used + 1);
         return Response.json(result);
       } catch (e) {
+        // Refund failed extractions, but a process crash can leave a reservation counted.
+        try {
+          await refundExtractSlot(usageKey);
+        } catch (refundError) {
+          console.error('KV quota refund failed:', refundError);
+        }
         return Response.json({ error: e instanceof Error ? e.message : 'Extraction failed' }, { status: 422 });
       } finally {
         extracting = false;
@@ -88,13 +107,19 @@ export default defineChannel({
         return Response.json({ error: 'Stripe not configured' }, { status: 503 });
       }
 
+      if (!isKvConfigured()) {
+        return Response.json({ error: 'Usage storage unavailable' }, { status: 503 });
+      }
+
       const apiKey = getApiKey(req);
+      if (!apiKey) return denied();
       const session = await stripe.checkout.sessions.create({
         mode: 'subscription',
         line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
         success_url: 'https://rovezi.com/?success=true',
         cancel_url: 'https://rovezi.com/?canceled=true',
-        metadata: { apiKey: apiKey ?? '' },
+        // Do not expose the API bearer token to Stripe metadata.
+        metadata: { apiKeyHash: hashApiKey(apiKey) },
       });
 
       return Response.json({ url: session.url });
@@ -109,7 +134,7 @@ export default defineChannel({
       const sig = req.headers.get('stripe-signature');
       const raw = await req.text();
 
-      let event;
+      let event: Stripe.Event;
       try {
         event = stripe.webhooks.constructEvent(raw, sig!, process.env.STRIPE_WEBHOOK_SECRET);
       } catch (err) {
@@ -119,10 +144,20 @@ export default defineChannel({
 
       console.log('Webhook received:', event.type);
       if (event.type === 'checkout.session.completed') {
-        const apiKey = event.data.object.metadata?.apiKey;
-        if (apiKey) {
-          paid.add(apiKey);
-          console.log('Marked paid:', apiKey);
+        const metadata = event.data.object.metadata;
+        // Old Checkout Sessions used raw apiKey metadata; continue to accept them.
+        const apiKeyHash = metadata?.apiKeyHash || (metadata?.apiKey ? hashApiKey(metadata.apiKey) : null);
+        if (!apiKeyHash) {
+          console.error('Checkout webhook missing API key metadata:', event.id);
+          return new Response('Missing checkout metadata', { status: 400 });
+        }
+        try {
+          const fresh = await recordCompletedCheckout(event.id, apiKeyHash);
+          console.log(fresh ? 'Checkout entitlement recorded' : 'Duplicate checkout ignored', event.id);
+        } catch (error) {
+          console.error('KV entitlement write failed:', error);
+          // Non-2xx tells Stripe to retry; never acknowledge an unwritten entitlement.
+          return new Response('Entitlement storage unavailable', { status: 503 });
         }
       }
 
