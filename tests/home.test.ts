@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import home, { homeResponse } from '../agent/channels/home.ts';
-import { HOME_PAGE_HTML } from '../agent/channels/home-page.ts';
+import { HOME_PAGE_HTML } from '../agent/lib/home-page.ts';
 
 const indexHtml = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
 
