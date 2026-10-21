@@ -1,5 +1,5 @@
 import { defineChannel, GET } from 'eve/channels';
-import { HOME_PAGE_HTML } from './home-page.ts';
+import { HOME_PAGE_HTML } from '../lib/home-page.ts';
 
 const FALLBACK_HTML = '<!doctype html><html lang="en"><meta charset="utf-8"><title>Rove</title><p>Rove is temporarily unavailable.</p></html>';
 const headers = { 'content-type': 'text/html; charset=utf-8' };
