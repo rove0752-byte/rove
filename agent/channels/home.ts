@@ -1,5 +1,6 @@
 import { defineChannel, GET } from 'eve/channels';
 import { HOME_PAGE_HTML } from '../lib/home-page.ts';
+import { STATIC_PAGES, renderStaticPage } from '../lib/static-pages.ts';
 
 const FALLBACK_HTML = '<!doctype html><html lang="en"><meta charset="utf-8"><title>Rove</title><p>Rove is temporarily unavailable.</p></html>';
 const headers = { 'content-type': 'text/html; charset=utf-8' };
@@ -14,5 +15,9 @@ export function homeResponse(getHtml: () => string = () => HOME_PAGE_HTML): Resp
 }
 
 export default defineChannel({
-  routes: [GET('/', async () => homeResponse())],
+  routes: [
+    GET('/', async () => homeResponse()),
+    ...Object.entries(STATIC_PAGES).map(([path, page]) =>
+      GET(path, async () => homeResponse(() => renderStaticPage(page)))),
+  ],
 });
