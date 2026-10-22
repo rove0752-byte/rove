@@ -77,3 +77,26 @@ test('duplicate webhook event does not reapply entitlement', async () => {
 test('invalid entitlement hash is rejected', async () => {
   await assert.rejects(recordCompletedCheckout('evt_invalid', 'plain'), /Invalid API key hash/);
 });
+
+test('month rollover uses a fresh UTC-month usage key with expiry after month end', async () => {
+  let expireArg: number | undefined;
+  const inner = globalThis.fetch;
+  globalThis.fetch = (async (u, o) => {
+    const [, , n, ...d] = JSON.parse(String(o?.body));
+    if (n === 2) expireArg = Number(d[3]);
+    return inner(u, o);
+  }) as typeof fetch;
+  try {
+    const oct = await claimExtractSlot('rollover', new Date('2026-10-31T23:59:59Z'));
+    assert.match(oct!, /:usage:2026-10:[a-f0-9]{64}$/);
+    assert.equal(expireArg, Date.UTC(2026, 10, 8) / 1000);
+    for (let i = 0; i < 49; i++) await claimExtractSlot('rollover', new Date('2026-10-31T23:59:59Z'));
+    assert.equal(await claimExtractSlot('rollover', new Date('2026-10-31T23:59:59Z')), null);
+    const nov = await claimExtractSlot('rollover', new Date('2026-11-01T00:00:00Z'));
+    assert.match(nov!, /:usage:2026-11:[a-f0-9]{64}$/);
+    assert.notEqual(nov, oct);
+    assert.equal(expireArg, Date.UTC(2026, 11, 8) / 1000);
+  } finally {
+    globalThis.fetch = inner;
+  }
+});

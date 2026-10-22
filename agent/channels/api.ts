@@ -10,6 +10,7 @@ import {
   claimExtractSlot,
   hashApiKey,
   isKvConfigured,
+  applySubscriptionStatus,
   recordCompletedCheckout,
   refundExtractSlot,
 } from '../lib/kv-store';
@@ -120,6 +121,8 @@ export default defineChannel({
         cancel_url: 'https://rovezi.com/?canceled=true',
         // Do not expose the API bearer token to Stripe metadata.
         metadata: { apiKeyHash: hashApiKey(apiKey) },
+        // Copied onto the subscription so cancel/reactivate events can find the entitlement.
+        subscription_data: { metadata: { apiKeyHash: hashApiKey(apiKey) } },
       });
 
       return Response.json({ url: session.url });
@@ -152,11 +155,26 @@ export default defineChannel({
           return new Response('Missing checkout metadata', { status: 400 });
         }
         try {
-          const fresh = await recordCompletedCheckout(event.id, apiKeyHash);
+          const session = event.data.object;
+          const subscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id;
+          const fresh = await recordCompletedCheckout(event.id, apiKeyHash, subscriptionId);
           console.log(fresh ? 'Checkout entitlement recorded' : 'Duplicate checkout ignored', event.id);
         } catch (error) {
           console.error('KV entitlement write failed:', error);
           // Non-2xx tells Stripe to retry; never acknowledge an unwritten entitlement.
+          return new Response('Entitlement storage unavailable', { status: 503 });
+        }
+      }
+
+      if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.updated') {
+        const subscription = event.data.object;
+        // A deleted subscription is always revoked, whatever status it reports.
+        const status = event.type === 'customer.subscription.deleted' ? 'canceled' : subscription.status;
+        try {
+          const result = await applySubscriptionStatus(event.id, subscription.id, status, subscription.metadata?.apiKeyHash);
+          console.log(`Subscription ${status}: ${result}`, event.id);
+        } catch (error) {
+          console.error('KV subscription update failed:', error);
           return new Response('Entitlement storage unavailable', { status: 503 });
         }
       }
