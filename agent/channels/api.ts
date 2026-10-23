@@ -5,7 +5,7 @@ import { chromium } from 'playwright';
 import { z } from 'zod';
 import Stripe from 'stripe';
 import { inspectPage } from '../lib/browser';
-import { validateUrl } from '../lib/policy';
+import { validateUrl, errorBody } from '../lib/policy';
 import { aiConfigured } from '../lib/ai-config.ts';
 import {
   claimExtractSlot,
@@ -123,7 +123,7 @@ export default defineChannel({
         try {
           input = z.object({ url: z.string().url().max(2048) }).strict().parse(await body(req));
         } catch (e) {
-          return Response.json({ error: e instanceof Error ? e.message : 'Invalid request' }, { status: 422 });
+          return Response.json(errorBody(e, 'Invalid request'), { status: 422 });
         }
         const t = await startTrial(req);
         if (t instanceof Response) return t;
@@ -133,7 +133,7 @@ export default defineChannel({
           return withTrial(Response.json({ ...result, trial: trialInfo(t) }), t);
         } catch (e) {
           await t.refund().catch(() => {});
-          return withTrial(Response.json({ error: e instanceof Error ? e.message : 'Extraction failed' }, { status: 422 }), t);
+          return withTrial(Response.json(errorBody(e, 'Extraction failed'), { status: 422 }), t);
         } finally {
           extracting = false;
         }
@@ -144,7 +144,7 @@ export default defineChannel({
       try {
         input = z.object({ url: z.string().url().max(2048) }).strict().parse(await body(req));
       } catch (e) {
-        return Response.json({ error: e instanceof Error ? e.message : 'Invalid request' }, { status: 422 });
+        return Response.json(errorBody(e, 'Invalid request'), { status: 422 });
       }
 
       const apiKey = getApiKey(req) ?? 'anonymous';
@@ -170,7 +170,7 @@ export default defineChannel({
         } catch (refundError) {
           console.error('KV quota refund failed:', refundError);
         }
-        return Response.json({ error: e instanceof Error ? e.message : 'Extraction failed' }, { status: 422 });
+        return Response.json(errorBody(e, 'Extraction failed'), { status: 422 });
       } finally {
         extracting = false;
       }
@@ -313,7 +313,7 @@ export default defineChannel({
         if (trial) return withTrial(Response.json({ ...accepted, trial: trialInfo(trial) }, { status: 202 }), trial);
         return Response.json(accepted, { status: 202 });
       } catch (e) {
-        const res = Response.json({ error: e instanceof Error ? e.message : 'Invalid task' }, { status: 422 });
+        const res = Response.json(errorBody(e, 'Invalid task'), { status: 422 });
         if (trial) { await trial.refund().catch(() => {}); return withTrial(res, trial); }
         return res;
       }
