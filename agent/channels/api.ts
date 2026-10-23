@@ -6,6 +6,7 @@ import { z } from 'zod';
 import Stripe from 'stripe';
 import { inspectPage } from '../lib/browser';
 import { validateUrl } from '../lib/policy';
+import { aiConfigured } from '../lib/ai-config.ts';
 import {
   claimExtractSlot,
   hashApiKey,
@@ -108,7 +109,7 @@ export default defineChannel({
         service: 'rove',
         version: '0.1.0',
         browserInstalled: (existsSync(chromium.executablePath()) || process.platform === 'linux'),
-        aiConfigured: !!(process.env.AI_GATEWAY_API_KEY || process.env.VERCEL_OIDC_TOKEN),
+        aiConfigured: aiConfigured(req),
         mode: 'read_only_no_javascript',
       });
     }),
@@ -288,7 +289,7 @@ export default defineChannel({
     POST('/v1/agent/run', async (req, { from }) => {
       const keyed = authorized(req);
       if (!keyed && hasAuthHeader(req)) return denied();
-      if (!process.env.AI_GATEWAY_API_KEY && !process.env.VERCEL_OIDC_TOKEN) {
+      if (!aiConfigured(req)) {
         return Response.json({ error: 'Configure AI_GATEWAY_API_KEY to enable AI tasks.' }, { status: 503 });
       }
       if (!(existsSync(chromium.executablePath()) || process.platform === 'linux')) {
@@ -336,6 +337,7 @@ export default defineChannel({
     GET('/v1/agent/runs/:id/stream', async (req, { attachSession, params }) => {
       // Keyed callers as before; website trial visitors may attach with their signed cookie (session ids are random UUIDs).
       if (!authorized(req) && (hasAuthHeader(req) || !trialCookieValid(req))) return denied();
+      aiConfigured(req);
       return new Response(await attachSession(params.id).getEventStream(), {
         headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
       });
