@@ -47,6 +47,16 @@ export function hashApiKey(apiKey: string): string {
   return createHash('sha256').update(apiKey).digest('hex');
 }
 
+/** Entitlement hash for a website visitor (signed trial cookie id); same paid/usage scheme as API keys. */
+export function visitorEntitlementHash(visitorId: string): string {
+  return hashApiKey(`visitor:${visitorId}`);
+}
+
+export async function isPaidHash(hash: string): Promise<boolean> {
+  if (!HASH_RE.test(hash)) return false;
+  return (await redis(['GET', `${namespace()}:paid:${hash}`])) === '1';
+}
+
 export function isKvConfigured(): boolean {
   return !!(
     (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL) &&

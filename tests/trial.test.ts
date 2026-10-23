@@ -81,3 +81,41 @@ test('redis store sends INCR + EXPIRE NX pipeline', async () => {
 test('home page has no API key UI and never sends Authorization', () => {
   assert.doesNotMatch(HOME_PAGE_HTML, /id="key"|API key|Authorization|Settings/);
 });
+
+import { returnOrigin } from '../agent/lib/trial.ts';
+import { visitorEntitlementHash, hashApiKey } from '../agent/lib/kv-store.ts';
+
+test('visitor entitlement hash is a 64-hex paid-scheme hash, distinct from any API key hash', () => {
+  const h = visitorEntitlementHash('abcdefghijklmnop');
+  assert.match(h, /^[a-f0-9]{64}$/);
+  assert.notEqual(h, hashApiKey('abcdefghijklmnop'));
+  assert.equal(h, hashApiKey('visitor:abcdefghijklmnop'));
+});
+
+test('checkout return origin only allows our own hosts', () => {
+  const r = (host: string) => returnOrigin(new Request('https://x.test/v1/checkout', { headers: { 'x-forwarded-host': host } }));
+  assert.equal(r('www.rovezi.com'), 'https://www.rovezi.com');
+  assert.equal(r('rove-abc123-budsatwork0-ais-projects.vercel.app'), 'https://rove-abc123-budsatwork0-ais-projects.vercel.app');
+  assert.equal(r('evil.example'), 'https://rovezi.com');
+  assert.equal(r('rove-x-budsatwork0-ais-projects.vercel.app.evil.example'), 'https://rovezi.com');
+});
+
+test('home page wires Upgrade to /v1/checkout and shows success/cancel banner', () => {
+  assert.match(HOME_PAGE_HTML, /id="upgrade">Upgrade for more runs</);
+  assert.match(HOME_PAGE_HTML, /fetch\('\/v1\/checkout'/);
+  assert.match(HOME_PAGE_HTML, /success'\)==='true'/);
+  assert.match(HOME_PAGE_HTML, /canceled'\)==='true'/);
+});
+
+test('isPaidHash reads the same paid key the webhook writes for a visitor', async () => {
+  const { isPaidHash } = await import('../agent/lib/kv-store.ts');
+  const prev = { ...process.env }; const f = globalThis.fetch; let cmd: unknown;
+  process.env.KV_REST_API_URL = 'https://kv.test'; process.env.KV_REST_API_TOKEN = 't'; delete process.env.VERCEL_ENV; delete process.env.STRIPE_SECRET_KEY;
+  globalThis.fetch = (async (_u: string, init: RequestInit) => { cmd = JSON.parse(String(init.body)); return new Response(JSON.stringify({ result: '1' })); }) as unknown as typeof fetch;
+  try {
+    const h = visitorEntitlementHash('abcdefghijklmnop');
+    assert.equal(await isPaidHash(h), true);
+    assert.deepEqual(cmd, ['GET', `rove:v1:nonproduction:test:paid:${h}`]);
+    assert.equal(await isPaidHash('not-a-hash'), false);
+  } finally { globalThis.fetch = f; process.env = prev; }
+});

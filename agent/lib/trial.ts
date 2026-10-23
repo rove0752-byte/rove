@@ -148,3 +148,10 @@ export function defaultStore(env = process.env): TrialStore {
   if (!shared) shared = env.KV_REST_API_URL && env.KV_REST_API_TOKEN ? redisStore(env.KV_REST_API_URL, env.KV_REST_API_TOKEN) : memoryStore();
   return shared;
 }
+
+/** Return URL for visitor checkout: the requesting deployment if it is ours, else the canonical site. */
+export function returnOrigin(req: Request): string {
+  const host = (req.headers.get('x-forwarded-host') || new URL(req.url).host).toLowerCase();
+  const ok = /^(www\.)?rovezi\.com$/.test(host) || /^rove-[a-z0-9-]+-budsatwork0-ais-projects\.vercel\.app$/.test(host);
+  return ok ? `https://${host}` : 'https://rovezi.com';
+}

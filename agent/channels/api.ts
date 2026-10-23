@@ -13,7 +13,10 @@ import {
   applySubscriptionStatus,
   recordCompletedCheckout,
   refundExtractSlot,
+  isPaidHash,
+  visitorEntitlementHash,
 } from '../lib/kv-store';
+import { consumeTrial, cookieHeader, defaultStore, deriveSecret, newVisitorId, peekTrial, returnOrigin, readCookie, signVisitor, verifyVisitor, type TrialResult } from '../lib/trial.ts';
 
 const runSchema = z.object({
   url: z.string().url().max(2048),
@@ -48,6 +51,55 @@ const denied = () => Response.json({ error: 'API key required' }, { status: 401 
 
 let extracting = false;
 
+// Anonymous website trial (see agent/lib/trial.ts). Only used when the request carries NO Authorization header;
+// a wrong key is still rejected exactly as before.
+type Trial = TrialResult & { refund: () => Promise<void>; paid?: boolean };
+const hasAuthHeader = (req: Request) => req.headers.has('authorization');
+const trialSecret = () => deriveSecret(process.env.ROVE_API_KEY);
+
+function withTrial(res: Response, t: TrialResult & { paid?: boolean }): Response {
+  if (t.setCookie) res.headers.append('set-cookie', t.setCookie);
+  if (!t.paid) res.headers.set('x-rove-trial-remaining', String(t.remaining));
+  res.headers.set('cache-control', 'no-store');
+  return res;
+}
+
+const trialInfo = (t: Trial) => (t.paid ? { paid: true } : { remaining: t.remaining, resetsAt: t.resetsAt });
+
+/** Paid visitors (upgraded via Checkout) use the paid entitlement instead of the daily trial. */
+async function paidVisitorRun(req: Request): Promise<Trial | null> {
+  const secret = trialSecret();
+  const id = secret ? verifyVisitor(secret, readCookie(req)) : null;
+  if (!id || !isKvConfigured()) return null;
+  const hash = visitorEntitlementHash(id);
+  if (!(await isPaidHash(hash))) return null;
+  const usageKey = await claimExtractSlot(`visitor:${id}`);
+  if (!usageKey) return null;
+  return { ok: true, paid: true, remaining: 0, limit: 0, resetsAt: '', refund: () => refundExtractSlot(usageKey) };
+}
+
+async function startTrial(req: Request): Promise<Trial | Response> {
+  const secret = trialSecret();
+  if (!secret) return denied();
+  let t: Trial;
+  try {
+    const paidRun = await paidVisitorRun(req);
+    if (paidRun) return paidRun;
+    t = await consumeTrial(defaultStore(), secret, req);
+  } catch { return Response.json({ code: 'trial_unavailable', error: 'Free runs are temporarily unavailable. Try again shortly.' }, { status: 503 }); }
+  if (!t.ok) {
+    return withTrial(Response.json({ code: 'trial_exhausted', error: "You've used today's free runs.", limit: t.limit, remaining: 0, resetsAt: t.resetsAt }, { status: 402 }), t);
+  }
+  return t;
+}
+
+function trialCookieValid(req: Request): boolean {
+  const secret = trialSecret();
+  return !!secret && !!verifyVisitor(secret, readCookie(req));
+}
+
+
+
 export default defineChannel({
   routes: [
     GET('/v1/health', async (req) => {
@@ -62,8 +114,29 @@ export default defineChannel({
     }),
 
     POST('/v1/extract', async (req) => {
-      if (!authorized(req)) return denied();
+      const keyed = authorized(req);
+      if (!keyed && hasAuthHeader(req)) return denied();
       if (extracting) return Response.json({ error: 'An extraction is running. Try again shortly.' }, { status: 429 });
+      if (!keyed) {
+        let input: { url: string };
+        try {
+          input = z.object({ url: z.string().url().max(2048) }).strict().parse(await body(req));
+        } catch (e) {
+          return Response.json({ error: e instanceof Error ? e.message : 'Invalid request' }, { status: 422 });
+        }
+        const t = await startTrial(req);
+        if (t instanceof Response) return t;
+        try {
+          extracting = true;
+          const result = await inspectPage(input.url);
+          return withTrial(Response.json({ ...result, trial: trialInfo(t) }), t);
+        } catch (e) {
+          await t.refund().catch(() => {});
+          return withTrial(Response.json({ error: e instanceof Error ? e.message : 'Extraction failed' }, { status: 422 }), t);
+        } finally {
+          extracting = false;
+        }
+      }
 
       // Parse before reserving quota so invalid payloads do not consume a slot.
       let input: { url: string };
@@ -103,7 +176,37 @@ export default defineChannel({
     }),
 
     POST('/v1/checkout', async (req) => {
-      if (!authorized(req)) return denied();
+      const keyed = authorized(req);
+      if (!keyed && hasAuthHeader(req)) return denied();
+      if (!keyed) {
+        // Website visitor upgrade: entitlement is tied to the signed trial cookie, never to a key.
+        const secret = trialSecret();
+        if (!secret) return denied();
+        if (!stripe || !process.env.STRIPE_PRICE_ID) return Response.json({ error: 'Stripe not configured' }, { status: 503 });
+        if (!isKvConfigured()) return Response.json({ error: 'Usage storage unavailable' }, { status: 503 });
+        let id = verifyVisitor(secret, readCookie(req));
+        let setCookie: string | undefined;
+        if (!id) { id = newVisitorId(); setCookie = cookieHeader(signVisitor(secret, id)); }
+        const hash = visitorEntitlementHash(id);
+        const origin = returnOrigin(req);
+        try {
+          const session = await stripe.checkout.sessions.create({
+            mode: 'subscription',
+            line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+            success_url: `${origin}/?success=true`,
+            cancel_url: `${origin}/?canceled=true`,
+            metadata: { apiKeyHash: hash, entitlement: 'visitor' },
+            subscription_data: { metadata: { apiKeyHash: hash, entitlement: 'visitor' } },
+          });
+          const res = Response.json({ url: session.url });
+          if (setCookie) res.headers.append('set-cookie', setCookie);
+          res.headers.set('cache-control', 'no-store');
+          return res;
+        } catch (error) {
+          console.error('Visitor checkout failed:', error instanceof Error ? error.message : 'unknown');
+          return Response.json({ error: 'Checkout unavailable' }, { status: 503 });
+        }
+      }
       if (!stripe || !process.env.STRIPE_PRICE_ID) {
         return Response.json({ error: 'Stripe not configured' }, { status: 503 });
       }
@@ -183,12 +286,19 @@ export default defineChannel({
     }),
 
     POST('/v1/agent/run', async (req, { from }) => {
-      if (!authorized(req)) return denied();
+      const keyed = authorized(req);
+      if (!keyed && hasAuthHeader(req)) return denied();
       if (!process.env.AI_GATEWAY_API_KEY && !process.env.VERCEL_OIDC_TOKEN) {
         return Response.json({ error: 'Configure AI_GATEWAY_API_KEY to enable AI tasks.' }, { status: 503 });
       }
       if (!(existsSync(chromium.executablePath()) || process.platform === 'linux')) {
         return Response.json({ error: 'Install the browser with npx playwright install chromium.' }, { status: 503 });
+      }
+      let trial: Trial | null = null;
+      if (!keyed) {
+        const t = await startTrial(req);
+        if (t instanceof Response) return t;
+        trial = t;
       }
       try {
         const input = runSchema.parse(await body(req));
@@ -198,17 +308,34 @@ export default defineChannel({
           JSON.stringify({ task: input.task, startUrl: input.url, outputFormat: input.outputFormat ?? 'JSON' }),
           { auth: null }
         );
-        return Response.json(
-          { runId, sessionId: session.id, status: 'accepted', streamUrl: `/v1/agent/runs/${session.id}/stream` },
-          { status: 202 }
-        );
+        const accepted = { runId, sessionId: session.id, status: 'accepted', streamUrl: `/v1/agent/runs/${session.id}/stream` };
+        if (trial) return withTrial(Response.json({ ...accepted, trial: trialInfo(trial) }, { status: 202 }), trial);
+        return Response.json(accepted, { status: 202 });
       } catch (e) {
-        return Response.json({ error: e instanceof Error ? e.message : 'Invalid task' }, { status: 422 });
+        const res = Response.json({ error: e instanceof Error ? e.message : 'Invalid task' }, { status: 422 });
+        if (trial) { await trial.refund().catch(() => {}); return withTrial(res, trial); }
+        return res;
+      }
+    }),
+
+    GET('/v1/trial', async (req) => {
+      const secret = trialSecret();
+      if (!secret) return Response.json({ code: 'trial_unavailable' }, { status: 503 });
+      try {
+        const id = verifyVisitor(secret, readCookie(req));
+        if (id && isKvConfigured() && await isPaidHash(visitorEntitlementHash(id))) {
+          return withTrial(Response.json({ paid: true }), { ok: true, paid: true, remaining: 0, limit: 0, resetsAt: '' });
+        }
+        const t = await peekTrial(defaultStore(), secret, req);
+        return withTrial(Response.json({ remaining: t.remaining, limit: t.limit, resetsAt: t.resetsAt }), t);
+      } catch {
+        return Response.json({ code: 'trial_unavailable' }, { status: 503 });
       }
     }),
 
     GET('/v1/agent/runs/:id/stream', async (req, { attachSession, params }) => {
-      if (!authorized(req)) return denied();
+      // Keyed callers as before; website trial visitors may attach with their signed cookie (session ids are random UUIDs).
+      if (!authorized(req) && (hasAuthHeader(req) || !trialCookieValid(req))) return denied();
       return new Response(await attachSession(params.id).getEventStream(), {
         headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
       });
