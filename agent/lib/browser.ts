@@ -13,6 +13,12 @@ export async function launchBrowser(): Promise<Browser> {
     executablePath: await bundledChromium.executablePath() });
 }
 
+// Small JPEG of the viewport for the chat's browser view; stripped before the model sees results.
+async function previewFrame(page: Page): Promise<string | undefined> {
+  try { return (await page.screenshot({ type: 'jpeg', quality: 55, timeout: 3000 })).toString('base64'); }
+  catch { return undefined; }
+}
+
 // Dependencies are injectable by local tests only; tools never accept policy overrides.
 export function createBrowserTools(dependencies: {
   launch?: () => Promise<Browser>;
@@ -121,7 +127,7 @@ export function createBrowserTools(dependencies: {
         capturedAt: new Date().toISOString(), text: content.slice(0, 18_000), truncated: content.length > 18_000,
         links, screenshotBase64: screenshot.toString('base64'),
         screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), durationMs: Date.now() - started,
-        mode: 'read_only_no_javascript' };
+        mode: 'read_only_no_javascript', previewJpegBase64: await previewFrame(page) };
     });
   }
 
@@ -143,7 +149,8 @@ export function createBrowserTools(dependencies: {
         }
       }
       return { evidenceId: randomUUID(), url: page.url(), title: await page.title(), httpStatus: status,
-        capturedAt: new Date().toISOString(), elements, truncated, mode: 'read_only_no_javascript' };
+        capturedAt: new Date().toISOString(), elements, truncated, mode: 'read_only_no_javascript',
+        previewJpegBase64: await previewFrame(page) };
     });
   }
   return { inspectPage, navigate };

@@ -6,6 +6,7 @@ import { z } from 'zod';
 import Stripe from 'stripe';
 import { inspectPage } from '../lib/browser';
 import { validateUrl, errorBody } from '../lib/policy';
+import { frameTransform } from '../lib/frames.ts';
 import { aiConfigured } from '../lib/ai-config.ts';
 import { defaultAllowStore } from '../lib/allowlist.ts';
 import { adminHandler, requestAccessHandler, type Deps } from '../lib/allowlist-routes.ts';
@@ -355,8 +356,11 @@ export default defineChannel({
       const enc = new TextEncoder();
       const ndjson = events.pipeThrough(new TransformStream<unknown, Uint8Array>({
         transform(ev, ctl) {
-          if (ev instanceof Uint8Array) ctl.enqueue(ev);
-          else ctl.enqueue(enc.encode((typeof ev === 'string' ? ev : JSON.stringify(ev)) + '\n'));
+          if (ev instanceof Uint8Array) { ctl.enqueue(ev); return; }
+          // Screenshot bytes become separate frame events for the chat's browser view.
+          for (const out of frameTransform(ev)) {
+            ctl.enqueue(enc.encode((typeof out === 'string' ? out : JSON.stringify(out)) + '\n'));
+          }
         },
       }));
       return new Response(ndjson, {
