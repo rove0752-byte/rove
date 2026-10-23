@@ -19,7 +19,7 @@ export async function adminHandler(req: Request, action: 'list' | 'add' | 'remov
   if (d.store) {
     try {
       const n = await d.store.hit(`${allowPrefix(env)}:adminrl:${h(d.secret, 'ip', clientIp(req))}:${Math.floor(now / 60000)}`, 120);
-      if (n > ADMIN_LIMIT_PER_MIN) return json({ code: 'rate_limited', error: 'Too many admin requests' }, 429);
+      if (n > ADMIN_LIMIT_PER_MIN) { const r = json({ code: 'rate_limited', error: 'Too many admin requests' }, 429); r.headers.set('retry-after', String(Math.max(1, 60 - Math.floor((now % 60000) / 1000)))); return r; }
     } catch { return json({ code: 'store_unavailable' }, 503); }
   }
   if (!adminAuthorized(req, env)) return json({ error: 'Admin key required' }, 401);

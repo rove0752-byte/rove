@@ -9,12 +9,12 @@ const WRITE_TIMEOUT_MS = 2500;
 // Labelled rough estimate, used only when the AI Gateway reports tokens but no cost. Not a billing figure.
 export const ESTIMATE_RATES_USD_PER_MTOK = { input: 1.25, output: 10 } as const;
 
-export type RunStatus = 'accepted' | 'completed' | 'failed' | 'rejected' | 'incomplete';
+export type RunStatus = 'accepted' | 'completed' | 'failed' | 'rejected' | 'abandoned' | 'incomplete';
 export type RunRecord = {
   id: string; sessionId?: string; requestType: 'agent_run' | 'extract';
   plan: 'trial' | 'paid' | 'api_key'; visitorHash?: string; host?: string;
   createdAt: string; finishedAt?: string; durationMs?: number; status: RunStatus;
-  errorCode?: string; errorMessage?: string; rejectedHost?: string;
+  errorCode?: string; errorMessage?: string; rejectedHost?: string; clientDisconnectedAt?: string;
   tokensIn?: number; tokensOut?: number; costUsd?: number; costSource?: 'gateway' | 'estimate' | 'none';
 };
 
@@ -154,7 +154,7 @@ export async function finishRun(sessionId: string, patch: Partial<RunRecord>, st
   } catch (e) { log('finish', e); }
 }
 
-/** A run with no terminal event after 10 minutes is reported as incomplete (nobody streamed it to the end). */
+/** A run with no terminal event after 10 minutes is reported as incomplete (last-resort sweep; normally the server-side watcher finalizes runs). */
 export function withEffectiveStatus(r: RunRecord, now = Date.now()): RunRecord {
   return r.status === 'accepted' && now - Date.parse(r.createdAt) > 10 * 60_000 ? { ...r, status: 'incomplete' } : r;
 }
@@ -165,4 +165,49 @@ export function filterRuns(runs: RunRecord[], f: RunFilter): RunRecord[] {
   return runs.map(r => withEffectiveStatus(r)).filter(r => (!f.status || r.status === f.status) && (!f.type || r.requestType === f.type) && (!f.plan || r.plan === f.plan)
     && (!f.errorCode || r.errorCode === f.errorCode) && (!f.host || r.host === f.host || r.rejectedHost === f.host)
     && (Number.isNaN(since) || Date.parse(r.createdAt) >= since)).slice(0, f.limit ?? 100);
+}
+
+/** Record a non-terminal note (e.g. the client hung up) unless the run already finished. Never throws. */
+export async function annotateRun(sessionId: string, patch: Partial<RunRecord>, store = defaultRunStore()): Promise<void> {
+  if (!store) return;
+  try {
+    const id = await store.bySession(sessionId); if (!id) return;
+    const rec = await store.get(id); if (!rec || rec.finishedAt) return;
+    await store.put({ ...rec, ...patch });
+  } catch (e) { log('annotate', e); }
+}
+
+/**
+ * Server-side watcher: reads the session's own event stream (independent of any client) and finalizes
+ * the run on its terminal event. If the stream ends or the deadline passes first, the run is finalized
+ * as 'abandoned' with whatever usage was seen. Never throws.
+ */
+export async function watchRun(sessionId: string, open: () => Promise<ReadableStream<unknown>>,
+  opts: { deadlineMs?: number; store?: ReturnType<typeof defaultRunStore> | RunStore; now?: () => number } = {}): Promise<void> {
+  const store = opts.store === undefined ? defaultRunStore() : opts.store;
+  if (!store) return;
+  const now = opts.now ?? Date.now;
+  let usage: Partial<RunRecord> = {};
+  let reader: ReadableStreamDefaultReader<unknown> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'timeout'>(r => { timer = setTimeout(() => r('timeout'), opts.deadlineMs ?? 170_000); });
+  let reason = 'stream_ended';
+  try {
+    reader = (await open()).getReader();
+    for (;;) {
+      const next = await Promise.race([reader.read(), timeout]);
+      if (next === 'timeout') { reason = 'watch_timeout'; break; }
+      if (next.done) break;
+      let ev: unknown = next.value;
+      if (ev instanceof Uint8Array) continue;
+      if (typeof ev === 'string') { try { ev = JSON.parse(ev); } catch { continue; } }
+      const u = (ev as { data?: { usage?: unknown } } | null)?.data?.usage;
+      if (u && typeof u === 'object') usage = usageFields(u as never);
+      const patch = finishPatch(ev, now());
+      if (patch) { await finishRun(sessionId, patch, store); return; }
+    }
+  } catch (e) { reason = 'watch_error'; log('watch', e); }
+  finally { clearTimeout(timer); reader?.cancel().catch(() => {}); }
+  await finishRun(sessionId, { status: 'abandoned', finishedAt: new Date(now()).toISOString(), errorCode: reason,
+    errorMessage: 'Run ended without a final event; recorded with partial data.', ...usage }, store);
 }

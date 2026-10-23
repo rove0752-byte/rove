@@ -62,3 +62,35 @@ test('filters and stale accepted runs report as incomplete', () => {
   assert.equal(withEffectiveStatus(runs[1]).status, 'incomplete');
   assert.deepEqual(filterRuns(runs, { status: 'incomplete' }).map(r => r.id), ['b1234567']);
 });
+
+import { watchRun } from '../agent/lib/runs.ts';
+const streamOf = (events: unknown[], hang = false) => async () => new ReadableStream<unknown>({
+  start(c) { for (const e of events) c.enqueue(e); if (!hang) c.close(); } });
+
+test('server-side watcher finalizes a run nobody streamed, using the terminal event', async () => {
+  const s = memoryRunStore();
+  await logRun(base({ id: 'w1234567', sessionId: 'sess_w1234567' }), s);
+  await watchRun('sess_w1234567', streamOf([{ type: 'session.started' }, JSON.stringify({ type: 'session.waiting', data: { usage: { inputTokens: 10, outputTokens: 2, costUsd: 0.001 } } })]), { store: s });
+  const r = (await s.get('w1234567'))!;
+  assert.equal(r.status, 'completed'); assert.equal(r.costSource, 'gateway'); assert.ok(r.finishedAt); assert.ok(r.durationMs! > 0);
+});
+
+test('watcher records abandoned with partial usage when the stream ends or times out early', async () => {
+  const s = memoryRunStore();
+  await logRun(base({ id: 'w2234567', sessionId: 'sess_w2234567' }), s);
+  await watchRun('sess_w2234567', streamOf([{ type: 'step.completed', data: { usage: { inputTokens: 50, outputTokens: 5 } } }]), { store: s });
+  let r = (await s.get('w2234567'))!;
+  assert.equal(r.status, 'abandoned'); assert.equal(r.errorCode, 'stream_ended'); assert.equal(r.tokensIn, 50); assert.equal(r.costSource, 'estimate');
+  await logRun(base({ id: 'w3234567', sessionId: 'sess_w3234567' }), s);
+  await watchRun('sess_w3234567', streamOf([], true), { store: s, deadlineMs: 20 });
+  r = (await s.get('w3234567'))!;
+  assert.equal(r.status, 'abandoned'); assert.equal(r.errorCode, 'watch_timeout');
+});
+
+test('watcher does not overwrite a run the stream route already finished', async () => {
+  const s = memoryRunStore();
+  await logRun(base({ id: 'w4234567', sessionId: 'sess_w4234567' }), s);
+  await finishRun('sess_w4234567', { status: 'completed', finishedAt: new Date().toISOString() }, s);
+  await watchRun('sess_w4234567', streamOf([]), { store: s });
+  assert.equal((await s.get('w4234567'))!.status, 'completed');
+});

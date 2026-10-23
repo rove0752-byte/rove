@@ -7,8 +7,9 @@ import Stripe from 'stripe';
 import { inspectPage } from '../lib/browser';
 import { validateUrl, errorBody } from '../lib/policy';
 import { frameTransform } from '../lib/frames.ts';
-import { defaultRunStore, filterRuns, finishPatch, finishRun, hostOf, logRun, visitorHashFor, type RunRecord } from '../lib/runs.ts';
-import { adminAuthorized } from '../lib/allowlist.ts';
+import { annotateRun, watchRun, defaultRunStore, filterRuns, finishPatch, finishRun, hostOf, logRun, visitorHashFor, type RunRecord } from '../lib/runs.ts';
+import { ADMIN_LIMIT_PER_MIN, adminAuthorized, allowPrefix } from '../lib/allowlist.ts';
+import { clientIp, hashId } from '../lib/trial.ts';
 import { aiConfigured } from '../lib/ai-config.ts';
 import { defaultAllowStore } from '../lib/allowlist.ts';
 import { adminHandler, requestAccessHandler, type Deps } from '../lib/allowlist-routes.ts';
@@ -122,6 +123,18 @@ async function rejectionFromResponse(res: Response): Promise<{ code?: string; er
 }
 const stripPreview = <T extends object>(r: T) => { const { previewJpegBase64: _p, ...rest } = r as T & { previewJpegBase64?: unknown }; return rest; };
 
+/** Same per-IP, per-minute limit (and key scheme) as the allowlist admin endpoints. */
+async function adminRateLimited(req: Request, now = Date.now()): Promise<Response | null> {
+  const d = allowDeps();
+  if (!d.store) return null;
+  try {
+    const n = await d.store.hit(`${allowPrefix()}:adminrl:${hashId(d.secret ?? Buffer.from('rove'), 'ip', clientIp(req))}:${Math.floor(now / 60000)}`, 120);
+    if (n > ADMIN_LIMIT_PER_MIN) return Response.json({ code: 'rate_limited', error: 'Too many admin requests' },
+      { status: 429, headers: { 'retry-after': String(Math.max(1, 60 - Math.floor((now % 60000) / 1000))), 'cache-control': 'no-store' } });
+  } catch { return Response.json({ code: 'store_unavailable' }, { status: 503 }); }
+  return null;
+}
+
 const allowDeps = (): Deps => ({
   store: defaultAllowStore(), secret: trialSecret(),
   configured: () => (process.env.ROVE_ALLOWED_HOSTS ?? '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean),
@@ -134,6 +147,8 @@ export default defineChannel({
     DELETE('/v1/admin/allowlist', (req) => adminHandler(req, 'remove', allowDeps())),
     DELETE('/v1/admin/allowlist/pending', (req) => adminHandler(req, 'dismiss', allowDeps())),
     GET('/v1/admin/runs', async (req) => {
+      const limited = await adminRateLimited(req);
+      if (limited) return limited;
       if (!adminAuthorized(req)) return Response.json({ error: 'Admin key required' }, { status: 401 });
       const store = defaultRunStore();
       if (!store) return Response.json({ code: 'store_unavailable', error: 'KV is not configured' }, { status: 503 });
@@ -368,6 +383,8 @@ export default defineChannel({
         );
         const accepted = { runId, sessionId: session.id, status: 'accepted', streamUrl: `/v1/agent/runs/${session.id}/stream` };
         track(waitUntil, { ...rec, sessionId: session.id });
+        // Finalize server-side regardless of whether the client ever reads (or finishes reading) the stream.
+        waitUntil(new Promise(r => setTimeout(r, 300)).then(() => watchRun(session.id, () => session.getEventStream() as Promise<ReadableStream<unknown>>)));
         if (trial) return withTrial(Response.json({ ...accepted, trial: trialInfo(trial) }, { status: 202 }), trial);
         return Response.json(accepted, { status: 202 });
       } catch (e) {
@@ -413,7 +430,11 @@ export default defineChannel({
           }
         },
       }));
-      return new Response(ndjson, {
+      // Client hung up early: note it; the server-side watcher still finalizes the run.
+      const watched = ndjson.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        cancel() { waitUntil(annotateRun(params.id, { clientDisconnectedAt: new Date().toISOString() })); },
+      } as Transformer<Uint8Array, Uint8Array>));
+      return new Response(watched, {
         headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
       });
     }),
