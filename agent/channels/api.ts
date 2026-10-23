@@ -1,4 +1,4 @@
-import { defineChannel, GET, POST } from 'eve/channels';
+import { defineChannel, DELETE, GET, POST } from 'eve/channels';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { chromium } from 'playwright';
@@ -7,6 +7,8 @@ import Stripe from 'stripe';
 import { inspectPage } from '../lib/browser';
 import { validateUrl, errorBody } from '../lib/policy';
 import { aiConfigured } from '../lib/ai-config.ts';
+import { defaultAllowStore } from '../lib/allowlist.ts';
+import { adminHandler, requestAccessHandler, type Deps } from '../lib/allowlist-routes.ts';
 import {
   claimExtractSlot,
   hashApiKey,
@@ -101,8 +103,19 @@ function trialCookieValid(req: Request): boolean {
 
 
 
+const allowDeps = (): Deps => ({
+  store: defaultAllowStore(), secret: trialSecret(),
+  configured: () => (process.env.ROVE_ALLOWED_HOSTS ?? '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean),
+});
+
 export default defineChannel({
   routes: [
+    GET('/v1/admin/allowlist', (req) => adminHandler(req, 'list', allowDeps())),
+    POST('/v1/admin/allowlist', (req) => adminHandler(req, 'add', allowDeps())),
+    DELETE('/v1/admin/allowlist', (req) => adminHandler(req, 'remove', allowDeps())),
+    DELETE('/v1/admin/allowlist/pending', (req) => adminHandler(req, 'dismiss', allowDeps())),
+    POST('/v1/allowlist/request', (req) => requestAccessHandler(req, allowDeps())),
+
     GET('/v1/health', async (req) => {
       if (!authorized(req)) return denied();
       return Response.json({
