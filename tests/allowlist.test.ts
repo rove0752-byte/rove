@@ -122,6 +122,6 @@ test('client: thanks message rendered via textContent; request button wired', ()
   const src = html.slice(html.indexOf('/*hints*/'), html.indexOf('/*/hints*/'));
   const { thanks } = new Function(src + '\nreturn { thanks };')() as { thanks: (h: string) => string };
   assert.equal(thanks('example.con'), "Thanks — we'll review example.con.");
-  assert.match(html, /\$\('message'\)\.textContent=thanks\(/);
-  assert.match(html, /id="reqsite"[^>]*>Request this site</);
+  assert.match(html, /n\.textContent=r\.ok\?thanks\(/);
+  assert.match(html, /b\.textContent='Request this site'/);
 });
