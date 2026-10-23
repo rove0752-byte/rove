@@ -338,7 +338,15 @@ export default defineChannel({
       // Keyed callers as before; website trial visitors may attach with their signed cookie (session ids are random UUIDs).
       if (!authorized(req) && (hasAuthHeader(req) || !trialCookieValid(req))) return denied();
       aiConfigured(req);
-      return new Response(await attachSession(params.id).getEventStream(), {
+      const events = (await attachSession(params.id).getEventStream()) as ReadableStream<unknown>;
+      const enc = new TextEncoder();
+      const ndjson = events.pipeThrough(new TransformStream<unknown, Uint8Array>({
+        transform(ev, ctl) {
+          if (ev instanceof Uint8Array) ctl.enqueue(ev);
+          else ctl.enqueue(enc.encode((typeof ev === 'string' ? ev : JSON.stringify(ev)) + '\n'));
+        },
+      }));
+      return new Response(ndjson, {
         headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
       });
     }),
