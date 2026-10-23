@@ -7,6 +7,8 @@ import Stripe from 'stripe';
 import { inspectPage } from '../lib/browser';
 import { validateUrl, errorBody } from '../lib/policy';
 import { frameTransform } from '../lib/frames.ts';
+import { defaultRunStore, filterRuns, finishPatch, finishRun, hostOf, logRun, visitorHashFor, type RunRecord } from '../lib/runs.ts';
+import { adminAuthorized } from '../lib/allowlist.ts';
 import { aiConfigured } from '../lib/ai-config.ts';
 import { defaultAllowStore } from '../lib/allowlist.ts';
 import { adminHandler, requestAccessHandler, type Deps } from '../lib/allowlist-routes.ts';
@@ -104,6 +106,22 @@ function trialCookieValid(req: Request): boolean {
 
 
 
+type Bg = (task: Promise<unknown>) => void;
+/** Run-log helpers: never awaited by the request path; failures are logged inside logRun. */
+function runBase(req: Request, type: RunRecord['requestType'], t: Trial | null, keyed: boolean): RunRecord {
+  return { id: randomUUID(), requestType: type, plan: keyed ? 'api_key' : t?.paid ? 'paid' : 'trial',
+    visitorHash: keyed ? undefined : visitorHashFor(trialSecret(), req, t?.setCookie), createdAt: new Date().toISOString(), status: 'accepted' };
+}
+function track(bg: Bg | undefined, rec: RunRecord) { const p = logRun(rec); if (bg) bg(p); else void p; }
+function rejectedFrom(base: RunRecord, err: { code?: string; error?: string; host?: string }, status: RunRecord['status'] = 'rejected'): RunRecord {
+  return { ...base, status, finishedAt: new Date().toISOString(), errorCode: err.code ?? (status === 'rejected' ? 'invalid_request' : 'failed'),
+    errorMessage: String(err.error ?? '').slice(0, 300), ...(err.code === 'host_not_allowed' && err.host ? { rejectedHost: String(err.host).slice(0, 253) } : {}) };
+}
+async function rejectionFromResponse(res: Response): Promise<{ code?: string; error?: string }> {
+  try { const d = await res.clone().json() as { code?: string; error?: string }; return { code: d.code ?? `http_${res.status}`, error: d.error }; } catch { return { code: `http_${res.status}` }; }
+}
+const stripPreview = <T extends object>(r: T) => { const { previewJpegBase64: _p, ...rest } = r as T & { previewJpegBase64?: unknown }; return rest; };
+
 const allowDeps = (): Deps => ({
   store: defaultAllowStore(), secret: trialSecret(),
   configured: () => (process.env.ROVE_ALLOWED_HOSTS ?? '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean),
@@ -115,6 +133,21 @@ export default defineChannel({
     POST('/v1/admin/allowlist', (req) => adminHandler(req, 'add', allowDeps())),
     DELETE('/v1/admin/allowlist', (req) => adminHandler(req, 'remove', allowDeps())),
     DELETE('/v1/admin/allowlist/pending', (req) => adminHandler(req, 'dismiss', allowDeps())),
+    GET('/v1/admin/runs', async (req) => {
+      if (!adminAuthorized(req)) return Response.json({ error: 'Admin key required' }, { status: 401 });
+      const store = defaultRunStore();
+      if (!store) return Response.json({ code: 'store_unavailable', error: 'KV is not configured' }, { status: 503 });
+      const q = new URL(req.url).searchParams;
+      const limit = Math.min(1000, Math.max(1, Number(q.get('limit')) || 100));
+      try {
+        const id = q.get('id');
+        if (id) { const r = await store.get(id); return Response.json({ runs: r ? [r] : [] }, { headers: { 'cache-control': 'no-store' } }); }
+        const scan = await store.recent([...q.keys()].some(k => k !== 'limit') ? 1000 : limit);
+        const runs = filterRuns(scan, { status: q.get('status') ?? undefined, type: q.get('type') ?? undefined, plan: q.get('plan') ?? undefined,
+          errorCode: q.get('errorCode') ?? undefined, host: q.get('host') ?? undefined, since: q.get('since') ?? undefined, limit });
+        return Response.json({ count: runs.length, scanned: scan.length, runs }, { headers: { 'cache-control': 'no-store' } });
+      } catch { return Response.json({ code: 'store_unavailable' }, { status: 503 }); }
+    }),
     POST('/v1/allowlist/request', (req) => requestAccessHandler(req, allowDeps())),
 
     GET('/v1/health', async (req) => {
@@ -128,7 +161,7 @@ export default defineChannel({
       });
     }),
 
-    POST('/v1/extract', async (req) => {
+    POST('/v1/extract', async (req, { waitUntil }) => {
       const keyed = authorized(req);
       if (!keyed && hasAuthHeader(req)) return denied();
       if (extracting) return Response.json({ error: 'An extraction is running. Try again shortly.' }, { status: 429 });
@@ -140,14 +173,18 @@ export default defineChannel({
           return Response.json(errorBody(e, 'Invalid request'), { status: 422 });
         }
         const t = await startTrial(req);
-        if (t instanceof Response) return t;
+        if (t instanceof Response) { track(waitUntil, rejectedFrom({ ...runBase(req, 'extract', null, false), host: hostOf(input.url) }, await rejectionFromResponse(t))); return t; }
+        const rec = { ...runBase(req, 'extract', t, false), host: hostOf(input.url) };
         try {
           extracting = true;
           const result = await inspectPage(input.url);
-          return withTrial(Response.json({ ...result, trial: trialInfo(t) }), t);
+          track(waitUntil, { ...rec, status: 'completed', finishedAt: new Date().toISOString(), costUsd: 0, costSource: 'none' });
+          return withTrial(Response.json({ ...stripPreview(result), trial: trialInfo(t) }), t);
         } catch (e) {
           await t.refund().catch(() => {});
-          return withTrial(Response.json(errorBody(e, 'Extraction failed'), { status: 422 }), t);
+          const err = errorBody(e, 'Extraction failed');
+          track(waitUntil, rejectedFrom(rec, err, err.code === 'host_not_allowed' ? 'rejected' : 'failed'));
+          return withTrial(Response.json(err, { status: 422 }), t);
         } finally {
           extracting = false;
         }
@@ -173,11 +210,15 @@ export default defineChannel({
         return Response.json({ error: 'Free limit reached (50/month). Upgrade via POST /v1/checkout' }, { status: 402 });
       }
 
+      const rec = { ...runBase(req, 'extract', null, true), host: hostOf(input.url) };
       try {
         extracting = true;
         const result = await inspectPage(input.url);
-        return Response.json(result);
+        track(waitUntil, { ...rec, status: 'completed', finishedAt: new Date().toISOString(), costUsd: 0, costSource: 'none' });
+        return Response.json(stripPreview(result));
       } catch (e) {
+        const err = errorBody(e, 'Extraction failed');
+        track(waitUntil, rejectedFrom(rec, err, err.code === 'host_not_allowed' ? 'rejected' : 'failed'));
         // Refund failed extractions, but a process crash can leave a reservation counted.
         try {
           await refundExtractSlot(usageKey);
@@ -300,7 +341,7 @@ export default defineChannel({
       return Response.json({ received: true });
     }),
 
-    POST('/v1/agent/run', async (req, { from }) => {
+    POST('/v1/agent/run', async (req, { from, waitUntil }) => {
       const keyed = authorized(req);
       if (!keyed && hasAuthHeader(req)) return denied();
       if (!aiConfigured(req)) {
@@ -312,22 +353,27 @@ export default defineChannel({
       let trial: Trial | null = null;
       if (!keyed) {
         const t = await startTrial(req);
-        if (t instanceof Response) return t;
+        if (t instanceof Response) { track(waitUntil, rejectedFrom(runBase(req, 'agent_run', null, false), await rejectionFromResponse(t))); return t; }
         trial = t;
       }
+      const rec = runBase(req, 'agent_run', trial, keyed);
       try {
         const input = runSchema.parse(await body(req));
+        rec.host = hostOf(input.url);
         await validateUrl(input.url);
-        const runId = randomUUID();
+        const runId = rec.id;
         const session = await from(runId).send(
           JSON.stringify({ task: input.task, startUrl: input.url, outputFormat: input.outputFormat ?? 'JSON' }),
           { auth: null }
         );
         const accepted = { runId, sessionId: session.id, status: 'accepted', streamUrl: `/v1/agent/runs/${session.id}/stream` };
+        track(waitUntil, { ...rec, sessionId: session.id });
         if (trial) return withTrial(Response.json({ ...accepted, trial: trialInfo(trial) }, { status: 202 }), trial);
         return Response.json(accepted, { status: 202 });
       } catch (e) {
-        const res = Response.json(errorBody(e, 'Invalid task'), { status: 422 });
+        const err = errorBody(e, 'Invalid task');
+        track(waitUntil, rejectedFrom(rec, err));
+        const res = Response.json(err, { status: 422 });
         if (trial) { await trial.refund().catch(() => {}); return withTrial(res, trial); }
         return res;
       }
@@ -348,7 +394,7 @@ export default defineChannel({
       }
     }),
 
-    GET('/v1/agent/runs/:id/stream', async (req, { attachSession, params }) => {
+    GET('/v1/agent/runs/:id/stream', async (req, { attachSession, params, waitUntil }) => {
       // Keyed callers as before; website trial visitors may attach with their signed cookie (session ids are random UUIDs).
       if (!authorized(req) && (hasAuthHeader(req) || !trialCookieValid(req))) return denied();
       aiConfigured(req);
@@ -357,6 +403,10 @@ export default defineChannel({
       const ndjson = events.pipeThrough(new TransformStream<unknown, Uint8Array>({
         transform(ev, ctl) {
           if (ev instanceof Uint8Array) { ctl.enqueue(ev); return; }
+          let parsed: unknown = ev;
+          if (typeof ev === 'string') { try { parsed = JSON.parse(ev); } catch { parsed = null; } }
+          const patch = finishPatch(parsed);
+          if (patch) waitUntil(finishRun(params.id, patch));
           // Screenshot bytes become separate frame events for the chat's browser view.
           for (const out of frameTransform(ev)) {
             ctl.enqueue(enc.encode((typeof out === 'string' ? out : JSON.stringify(out)) + '\n'));
